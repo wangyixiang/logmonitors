@@ -1,7 +1,8 @@
 // Monitor plug/unplug logger for Windows (C++ Win32, no external deps)
 // Records connect/disconnect with adapter LUID + targetId, output technology,
 // friendly names, DXGI adapter info, PNPDeviceID, EDID hash (best effort).
-// Logs to C:\ProgramData\MonitorEvents\events.log with rotation.
+// Logs to C:\ProgramData\MonitorEvents\events.json with rotation.
+// compile: cl /std:c++17 /EHsc /DUNICODE /D_UNICODE /utf-8 main.cpp /link user32.lib shell32.lib dxgi.lib shlwapi.lib advapi32.lib crypt32.lib ole32.lib oleaut32.lib wbemuuid.lib
 
 #define NOMINMAX
 #include <Windows.h>
@@ -9,6 +10,7 @@
 #include <devguid.h>
 #include <dxgi.h>
 #include <Shlwapi.h>
+#include <Shellapi.h>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -18,6 +20,7 @@
 #include <chrono>
 #include <algorithm>
 #include <filesystem>
+#include <wbemidl.h>
 
 #include <wincrypt.h>
 #include <strsafe.h>
@@ -27,6 +30,10 @@
 #pragma comment(lib, "Advapi32.lib")
 #pragma comment(lib, "Crypt32.lib")
 #pragma comment(lib, "Shlwapi.lib")
+#pragma comment(lib, "Shell32.lib")
+#pragma comment(lib, "Ole32.lib")
+#pragma comment(lib, "OleAut32.lib")
+#pragma comment(lib, "wbemuuid.lib")
 
 // Stable monitor interface GUID (avoid SDK macro dependency)
 // {E6F07B5F-EE97-4A90-B076-33F57BF4EAA7}
@@ -323,6 +330,56 @@ struct KeyHash {
 std::unordered_map<std::wstring, TargetInfo, KeyHash> g_prev; // key = LUID:targetId
 std::unordered_map<std::wstring, ULONGLONG, KeyHash> g_lastEmit; // key+action -> tick
 DxgiCache g_dxgi;
+HWND g_hwnd = nullptr;
+HANDLE g_wmiThread = nullptr;
+HANDLE g_wmiStopEvent = nullptr;
+IWbemServices* g_wmiServices = nullptr;
+IWbemObjectSink* g_wmiSink = nullptr;
+void RequestEnumerate(HWND);
+class WmiSink : public IWbemObjectSink {
+    LONG m_ref;
+    HWND m_hwnd;
+public:
+    WmiSink(HWND h) : m_ref(1), m_hwnd(h) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) {
+        if (riid == IID_IUnknown || riid == IID_IWbemObjectSink) { *ppv = this; AddRef(); return S_OK; }
+        *ppv = nullptr; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() { return InterlockedIncrement(&m_ref); }
+    ULONG STDMETHODCALLTYPE Release() { ULONG r = InterlockedDecrement(&m_ref); if (!r) delete this; return r; }
+    HRESULT STDMETHODCALLTYPE Indicate(LONG, IWbemClassObject**) {
+        RequestEnumerate(m_hwnd);
+        return WBEM_S_NO_ERROR;
+    }
+    HRESULT STDMETHODCALLTYPE SetStatus(LONG, HRESULT, BSTR, IWbemClassObject*) { return WBEM_S_NO_ERROR; }
+};
+DWORD WINAPI WmiThread(LPVOID) {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hr)) return 0;
+    CoInitializeSecurity(nullptr, -1, nullptr, nullptr, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE, nullptr);
+    IWbemLocator* pLoc = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER, IID_IWbemLocator, (void**)&pLoc))) { CoUninitialize(); return 0; }
+    BSTR ns = SysAllocString(L"ROOT\\CIMV2");
+    hr = pLoc->ConnectServer(ns, nullptr, nullptr, nullptr, 0, nullptr, nullptr, &g_wmiServices);
+    SysFreeString(ns);
+    pLoc->Release();
+    if (FAILED(hr)) { CoUninitialize(); return 0; }
+    CoSetProxyBlanket(g_wmiServices, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
+    g_wmiSink = new WmiSink(g_hwnd);
+    g_wmiSink->AddRef();
+    BSTR wql = SysAllocString(L"WQL");
+    BSTR q1 = SysAllocString(L"SELECT * FROM Win32_DeviceChangeEvent");
+    BSTR q2 = SysAllocString(L"SELECT * FROM __InstanceOperationEvent WITHIN 2 WHERE TargetInstance ISA 'Win32_PnPEntity' AND TargetInstance.PNPClass='Monitor'");
+    g_wmiServices->ExecNotificationQueryAsync(wql, q1, WBEM_FLAG_SEND_STATUS, nullptr, g_wmiSink);
+    g_wmiServices->ExecNotificationQueryAsync(wql, q2, WBEM_FLAG_SEND_STATUS, nullptr, g_wmiSink);
+    SysFreeString(wql); SysFreeString(q1); SysFreeString(q2);
+    WaitForSingleObject(g_wmiStopEvent, INFINITE);
+    if (g_wmiServices && g_wmiSink) g_wmiServices->CancelAsyncCall(g_wmiSink);
+    if (g_wmiSink) { g_wmiSink->Release(); g_wmiSink = nullptr; }
+    if (g_wmiServices) { g_wmiServices->Release(); g_wmiServices = nullptr; }
+    CoUninitialize();
+    return 0;
+}
 
 std::wstring MakeKey(const TargetInfo& ti) {
     return LuidToString(ti.adapterLuid) + L":" + std::to_wstring(ti.targetId);
@@ -400,6 +457,41 @@ static const UINT_PTR kTimerId = 1;
 
 HDEVNOTIFY g_hDevNotify = nullptr;
 
+static NOTIFYICONDATAW g_nid{};
+static const UINT WM_TRAYICON = WM_APP + 1;
+#define ID_TRAY_OPENLOG 1003
+#define ID_TRAY_EXIT    1004
+
+void TrayAdd(HWND hwnd) {
+    ZeroMemory(&g_nid, sizeof(g_nid));
+    g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd = hwnd;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAYICON;
+    g_nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wcscpy_s(g_nid.szTip, L"MonitorEvents");
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
+}
+void TrayRemove(HWND) {
+    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+}
+void TrayUpdateTip() {
+    wcscpy_s(g_nid.szTip, L"MonitorEvents");
+    g_nid.uFlags = NIF_TIP;
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+}
+void TrayShowMenu(HWND hwnd) {
+    HMENU hMenu = CreatePopupMenu();
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPENLOG, L"打开日志目录");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出");
+    POINT pt; GetCursorPos(&pt);
+    SetForegroundWindow(hwnd);
+    TrackPopupMenu(hMenu, TPM_LEFTALIGN | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, nullptr);
+    DestroyMenu(hMenu);
+}
+
 void RequestEnumerate(HWND hwnd) {
     // arm storm suppression timer
     SetTimer(hwnd, kTimerId, kEnumDelayMs, nullptr);
@@ -408,12 +500,16 @@ void RequestEnumerate(HWND hwnd) {
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
+        g_hwnd = hwnd;
         DEV_BROADCAST_DEVICEINTERFACE filter{};
         filter.dbcc_size = sizeof(filter);
         filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
         filter.dbcc_classguid = kGuidDevInterfaceMonitor;
         g_hDevNotify = RegisterDeviceNotificationW(hwnd, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
-        // initial snapshot without logging
+        g_wmiStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        g_wmiThread = CreateThread(nullptr, 0, WmiThread, nullptr, 0, nullptr);
+        TrayAdd(hwnd);
+        TrayUpdateTip();
         g_prev.clear();
         auto snapshot = EnumerateActiveTargets();
         for (auto& ti : snapshot) g_prev.emplace(MakeKey(ti), ti);
@@ -431,8 +527,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             DiffAndLog(cur);
         }
         break;
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case ID_TRAY_OPENLOG:
+            ShellExecuteW(hwnd, L"open", kLogDir, nullptr, nullptr, SW_SHOWNORMAL);
+            break;
+        case ID_TRAY_EXIT:
+            DestroyWindow(hwnd);
+            break;
+        }
+        break;
+    case WM_TRAYICON:
+        if (lParam == WM_RBUTTONUP) {
+            TrayShowMenu(hwnd);
+        } else if (lParam == WM_LBUTTONUP || lParam == WM_LBUTTONDBLCLK) {
+            ShellExecuteW(hwnd, L"open", kLogDir, nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        break;
     case WM_DESTROY:
+        TrayRemove(hwnd);
         if (g_hDevNotify) { UnregisterDeviceNotification(g_hDevNotify); g_hDevNotify = nullptr; }
+        if (g_wmiStopEvent) { SetEvent(g_wmiStopEvent); }
+        if (g_wmiThread) { WaitForSingleObject(g_wmiThread, 5000); CloseHandle(g_wmiThread); g_wmiThread = nullptr; }
+        if (g_wmiStopEvent) { CloseHandle(g_wmiStopEvent); g_wmiStopEvent = nullptr; }
         PostQuitMessage(0);
         break;
     default:
